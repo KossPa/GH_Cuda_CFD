@@ -126,7 +126,7 @@ namespace FFD_SolverComponent
                 sb.Append($"[{f}:{faceVox[f].Length}] ");
             AddRuntimeMessage(GH_RuntimeMessageLevel.Remark, sb.ToString());
 
-            // A) Mark WALLS first (fluid only)
+            // a) Mark WALLS first (fluid only)
             for (int idx = 0; idx < wallFaces.Count; ++idx)
             {
                 int fi = wallFaces[idx];

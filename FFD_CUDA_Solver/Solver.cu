@@ -1,5 +1,4 @@
-﻿/*  Solver.cu  ── CUDA 12.9  •  builds into FFD_CUDA_Solver.dll
-    self-contained; requires only SolverAPI.h next to this file            */
+﻿/*  ----- Cuda 12.9 , check also header SolverAPI as its needed ------*/
 
 #include "SolverAPI.h"
 
@@ -10,7 +9,7 @@
 #include <algorithm>  // std::swap  (host)
 #define CUDA_OK(x) { gpuAssert((x),__FILE__,__LINE__); }
 
-    /* Set to 1 if you really want to synchronize after each kernel in Debug. */
+ /* ------------------------------------ Set to 1 to synchronize after each kernel in Debug ------------------------------------ */
 #ifndef DEBUG_SYNC
 #define DEBUG_SYNC 0
 #endif
@@ -25,7 +24,7 @@
         CUDA_OK(cudaDeviceSynchronize());                                     \
     } while(0)
 #else
-  /* Non-blocking check: catch errors without stalling the GPU. */
+  /*------------------------------------  Non-blocking check: catch errors without stalling the GPU. ------------------------------------ */
 #define CUDA_CHECK_KERNEL() do {                                          \
         cudaError_t e__ = cudaGetLastError();                                 \
         if (e__ != cudaSuccess)                                               \
@@ -37,19 +36,19 @@
 #define CUDA_CHECK_KERNEL() do {} while(0)
 #endif
 
-/* Set >0 to check residual every N Jacobi iterations, 0 to disable (fastest). */
+/* ------------------------------------  Set >0 to check residual every N Jacobi iterations, 0 to disable (fastest)------------------------------------ . */
 #ifndef PRESSURE_RESIDUAL_CHECK_EVERY
 #define PRESSURE_RESIDUAL_CHECK_EVERY 0
 #endif
 
-    /* ═══ utilities ════════════════════════════════════════════════════════ */
+/*------------------------------------  utilities ------------------------------------  */
 
 inline void gpuAssert(cudaError_t c, const char* f, int l)
 {
     if (c != cudaSuccess)
         fprintf(stderr, "CUDA %s  at  %s:%d\n", cudaGetErrorString(c), f, l);
 }
-
+//for this check the CellFlag
 enum : unsigned char {
     CF_FLUID = 0,
     CF_SOLID = 1,   // 0001
@@ -74,11 +73,11 @@ __global__ void setValueKernel(T* p, T v, int N)
     if (id < N) p[id] = v;
 }
 
-/* clamp helpers usable on host + device */
+/*------------------------------------  clamp helpers usable on host + device ------------------------------------ */
 __device__ __host__ inline int   clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 __device__          inline float clampF(float v, float lo, float hi) { return fminf(hi, fmaxf(lo, v)); }
 
-/* ═══ boundary kernel ══════════════════════════════════════════════════ */
+/* ------------------------------------ boundary kernel to flag the cells on domain faces------------------------------------*/
 __global__ void BoundaryVelocityKernel(float* u, float* v, float* w,
     const unsigned char* flag,
     float inX, float inY, float inZ,
@@ -91,7 +90,7 @@ __global__ void BoundaryVelocityKernel(float* u, float* v, float* w,
     else if (isWall(f) || isSolid(f)) { u[id] = v[id] = w[id] = 0.f; }
 }
 
-/* ═══ sampler helpers ══════════════════════════════════════════════════ */
+/* ------------------------------------ ═ sampler helpers ------------------------------------  */
 __device__ inline float at(const float* s, int i, int j, int k,
     int nx, int ny, int nz)
 {
@@ -127,7 +126,8 @@ __device__ float sampleLinear(const float* s, float gx, float gy, float gz,
     return c0 * (1 - tz) + c1 * tz;
 }
 
-/* ═══ advection ════════════════════════════════════════════════════════ */
+
+/* ------------------------------------  advection------------------------------------  */
 __global__ void AdvectKernel(float* dst, const float* src,
     const float* u, const float* v, const float* w,
     const unsigned char* flag,
@@ -150,6 +150,8 @@ __global__ void AdvectKernel(float* dst, const float* src,
     dst[id] = sampleLinear(src, gx, gy, gz, nx, ny, nz);
 }
 
+
+/* ------------------------------------  diffusion ------------------------------------  */
 __global__ void DiffuseJacobiKernel(float* dst, const float* src,
     const unsigned char* flag,
     int nx, int ny, int nz,
@@ -172,6 +174,8 @@ __global__ void DiffuseJacobiKernel(float* dst, const float* src,
     dst[id] = (src[id] + ax * sx + ay * sy + az * sz) * rBeta;
 }
 
+
+/* ------------------------------------  divergence ------------------------------------  */
 __global__ void DivergenceKernel(const float* u, const float* v, const float* w,
     const unsigned char* flag, float* div,
     int nx, int ny, int nz,
@@ -188,7 +192,7 @@ __global__ void DivergenceKernel(const float* u, const float* v, const float* w,
     unsigned char f0 = flag[id];
     if (isSolid(f0) || isWall(f0)) { div[id] = 0.f; return; }
 
-    // Neighbor flags (inside-domain); used for one-sided BC at walls/solids
+    // Neighbor flags (inside-domain) used for one-sided BC at walls/solids
     unsigned char fl = (i > 0) ? flag[flatten(i - 1, j, k, nx, ny, nz)] : f0;
     unsigned char fr = (i < nx - 1) ? flag[flatten(i + 1, j, k, nx, ny, nz)] : f0;
     unsigned char fb = (j > 0) ? flag[flatten(i, j - 1, k, nx, ny, nz)] : f0;
@@ -206,10 +210,10 @@ __global__ void DivergenceKernel(const float* u, const float* v, const float* w,
     // Center values
     float ui = u[id], vi = v[id], wi = w[id];
 
-    // Helpers to read in-bounds neighbor (no clamping)
+    // Helpers to read inbounds neighbor (no clamping)
     auto at_nb = [&](const float* s, int ii, int jj, int kk) -> float
         {
-            if (ii < 0 || ii >= nx || jj < 0 || jj >= ny || kk < 0 || kk >= nz) return 0.f; // unused if we guard correctly
+            if (ii < 0 || ii >= nx || jj < 0 || jj >= ny || kk < 0 || kk >= nz) return 0.f; // this remeains unused mostly unless guard fails
             return s[flatten(ii, jj, kk, nx, ny, nz)];
         };
 
@@ -240,7 +244,8 @@ __global__ void DivergenceKernel(const float* u, const float* v, const float* w,
     div[id] = dudx + dvdy + dwdz;
 }
 
-/* ═══ pressure Poisson (Jacobi) – no atomics here ═════════════════════ */
+/* ------------------------------------ pressure Poisson (Jacobi)   ------------------------------------ 
+here each thread finds its cell checks if its boundary or not if so apply boun. condition if not read neighbour pressures combine with divergence then compute new p and write it in a new array.*/
 __global__ void JacobiPressureKernel(
     float* __restrict__ pN,          // new pressure
     const float* __restrict__ pO,    // old pressure
@@ -298,7 +303,7 @@ __global__ void ResidualComputeKernel(
     *outCnt = cnt;
 }
 
-/* ═══ projection (subtract grad p) ═════════════════════════════════════ */
+/* ------------------------------------ projection (subtract grad p) ------------------------------------ */
 __global__ void PressureGradKernel(const float* p, const unsigned char* flag,
     float* u, float* v, float* w,
     int nx, int ny, int nz,
@@ -316,7 +321,7 @@ __global__ void PressureGradKernel(const float* p, const unsigned char* flag,
 
     u[id] -= scale * dpdx; v[id] -= scale * dpdy; w[id] -= scale * dpdz;
 }
-/* ═══ outflow BC: zero normal gradient on velocity (copy interior) ═══ */
+/* ------------------------------------ outflow BC: zero normal gradient on velocity (copy interior) ------------------------------------ */
 __global__ void OutflowZeroGradKernel(
     float* u, float* v, float* w,
     const unsigned char* flag,
@@ -347,7 +352,7 @@ __global__ void OutflowZeroGradKernel(
     v[id] = v[nid];
     w[id] = w[nid];
 }
-/* ═══ host entry ═══════════════════════════════════════════════════════ */
+/* ------------------------------------ host entry ------------------------------------ */
 extern "C" __declspec(dllexport)
 int RunCFDSimulation(const unsigned char* hFlag,
     int   nx, int  ny, int  nz,
@@ -360,7 +365,7 @@ int RunCFDSimulation(const unsigned char* hFlag,
     float* hP,
     float* hUVW)
 {
-    /* --- constants --------------------------------------------------- */
+    /* ------------------------------------ constants --------------------------------------------------- */
     const int   N = nx * ny * nz;
     const float hx = dx, hy = dy, hz = dz;
 
@@ -380,23 +385,23 @@ int RunCFDSimulation(const unsigned char* hFlag,
 
     // NEW: iteration counts from caller (clamped to >=1)
     const int   NUM_STEPS = (numSteps > 0) ? numSteps : 20;
-    const int   DIFF_ITERS = (diffIters > 0) ? diffIters : 20;
-    const int   PRESSURE_ITERS = (pressureIters > 0) ? pressureIters : 20;
+    const int   DIFF_ITERS = (diffIters > 0) ? diffIters : 20;                    ////////Pressure and Diffussion are called in every step ////// 20 is enough to get a result especially for small grids //////
+    const int   PRESSURE_ITERS = (pressureIters > 0) ? pressureIters : 20;                
 
-    /* --- diffusion coefficients (implicit Jacobi) ------------------- */
+    /* ------------------------------------ diffusion coefficients (implicit Jacobi) ------------------- */
     const float aDx = dt * nu / (hx * hx);
     const float aDy = dt * nu / (hy * hy);
     const float aDz = dt * nu / (hz * hz);
     const float rBD = 1.f / (1.f + 2.f * (aDx + aDy + aDz));
 
-    /* --- pressure Poisson coefficients: ∇²p = (ρ/Δt) ∇·u ------------ */
+    /* ------------------------------------ pressure Poisson coefficients: ∇²p = (ρ/Δt) ∇·u ------------ */
     const float aPx = 1.f / (hx * hx);
     const float aPy = 1.f / (hy * hy);
     const float aPz = 1.f / (hz * hz);
     const float rBP = 1.f / (2.f * (aPx + aPy + aPz));
     const float bScale = rho / dt;
 
-    /* --- device buffers --------------------------------------------- */
+    /* ------------------------------------ device buffers --------------------------------------------- */
     float* u;   CUDA_OK(cudaMalloc(&u, N * sizeof(float)));
     float* v;   CUDA_OK(cudaMalloc(&v, N * sizeof(float)));
     float* w;   CUDA_OK(cudaMalloc(&w, N * sizeof(float)));
@@ -410,13 +415,13 @@ int RunCFDSimulation(const unsigned char* hFlag,
     unsigned char* dFlag; CUDA_OK(cudaMalloc(&dFlag, N * sizeof(unsigned char)));
     CUDA_OK(cudaMemcpy(dFlag, hFlag, N * sizeof(unsigned char), cudaMemcpyHostToDevice));
 
-    // Scalars for residual early-stop (device-side, no atomics)
+    // Scalars for residual early-stop
     float* dRes; CUDA_OK(cudaMalloc(&dRes, sizeof(float)));
     int* dCnt; CUDA_OK(cudaMalloc(&dCnt, sizeof(int)));
 
     dim3 blk(256), grd((N + blk.x - 1) / blk.x);
 
-    /* --- zero initialise everything + set inflow/wall conditions ---- */
+    /* ------------------------------------ zero initialise everything + set inflow/wall conditions ------------------------------------ */
     setValueKernel << <grd, blk >> > (u, 0.f, N);
     setValueKernel << <grd, blk >> > (v, 0.f, N);
     setValueKernel << <grd, blk >> > (w, 0.f, N);
@@ -435,7 +440,7 @@ int RunCFDSimulation(const unsigned char* hFlag,
     const float pRef = fmaxf(0.5f * rho * vin * vin, 1e-2f); // Pa
     const float tolP = 1e-4f * pRef;                         // RMS update target
 
-    /* ═════════════════ simulation loop ═══════════════════════════════ */
+    /* ------------------------------------ simulation loop follows Jos stam stable fluids approach with a few kinks here and there ------------------------------------ */
     for (int step = 0; step < NUM_STEPS; ++step)
     {
         /* 1 ─ advection ---------------------------------------------- */
@@ -503,7 +508,7 @@ int RunCFDSimulation(const unsigned char* hFlag,
         BoundaryVelocityKernel << <grd, blk >> > (u, v, w, dFlag, inX, inY, inZ, N);
         CUDA_CHECK_KERNEL();
     }
-    /* ═════════════════ end loop ═════════════════════════════════════ */
+    
 
     /* --- copy back --------------------------------------------------- */
     CUDA_OK(cudaMemcpy(hP, p, N * sizeof(float), cudaMemcpyDeviceToHost));
@@ -518,5 +523,5 @@ int RunCFDSimulation(const unsigned char* hFlag,
     cudaFree(dRes); cudaFree(dCnt);
     cudaFree(dFlag);
 
-    return 0;   // success
+    return 0;
 }

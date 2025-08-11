@@ -3,8 +3,7 @@
 namespace FFD_SolverComponent.Utils
 {
     /// <summary>
-    /// Thin P/Invoke layer – _signature MUST stay identical_ to the one
-    /// exported from <c>SolverAPI.h</c> / <c>Solver.cu</c>.
+    /// Thin P/Invoke layer – _signature MUST stay identical_ to <c>SolverAPI.h</c>  <c>Solver.cu</c>.
     /// </summary>
     internal static class CudaCFDInterop
     {
