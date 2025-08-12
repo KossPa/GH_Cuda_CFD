@@ -42,6 +42,7 @@ namespace FFD_VisualizerComponent
             pManager.AddIntegerParameter("Section axis", "A", "0=X  1=Y  2=Z  –1=all (vectors only)", GH_ParamAccess.item, -1);
             pManager.AddIntegerParameter("Slice index", "S", "Index along axis", GH_ParamAccess.item, 0);
             pManager.AddNumberParameter("Scale", "L", "Vector length scale (m per m/s)", GH_ParamAccess.item, 1.0);
+            pManager.AddIntegerParameter("Colormap", "C", "0 = BlueRed (default), 1 = Plasma", GH_ParamAccess.item, 0);
         }
         private readonly List<Line> _lines = new List<Line>();
         private readonly List<Color> _col = new List<Color>();
@@ -101,6 +102,10 @@ namespace FFD_VisualizerComponent
             double scale = 1.0; DA.GetData(11, ref scale);
             scale = Math.Max(1e-9, scale);
 
+            int cmapIdx = 0; DA.GetData(12, ref cmapIdx);
+            if (cmapIdx < 0) cmapIdx = 0; if (cmapIdx > 1) cmapIdx = 1;
+            var cmap = (Utils.ColorMap)cmapIdx;
+
             if (axis >= 0)
             {
                 int max = (axis == 0) ? Rx - 1 : (axis == 1) ? Ry - 1 : Rz - 1;
@@ -129,7 +134,7 @@ namespace FFD_VisualizerComponent
                     }
             if (!(minS < maxS)) { minS = 0; maxS = 1; }
 
-            /* ── build preview lines (unchanged) ───────────────────────────── */
+            /* ── build preview lines ───────────────────────────── */
             for (int k = 0; k < Rz; ++k)
                 for (int j = 0; j < Ry; ++j)
                     for (int i = 0; i < Rx; ++i)
@@ -152,7 +157,7 @@ namespace FFD_VisualizerComponent
                         Line ln = new Line(p, v * scale);
 
                         _lines.Add(ln);
-                        _col.Add(VisHelpers.Ramp(s, minS, maxS));
+                        _col.Add(VisHelpers.Ramp(s, minS, maxS, cmap));
                         _width.Add(1);
                     }
 
@@ -168,7 +173,7 @@ namespace FFD_VisualizerComponent
                 VisHelpers.FindSliceMinMax(axis, slice, Rx, Ry, Rz, Speed, out vMin, out vMax);
                 if (!(vMin < vMax)) { vMin = 0; vMax = 1; }
                 mVel = VisHelpers.BuildSliceMesh(axis, slice, Rx, Ry, Rz, dx, dy, dz, origin,
-                                                 Speed, vMin, vMax);
+                                                 Speed, vMin, vMax, cmap);
 
                 // Pressure slice
                 Func<int, double> Pval = id => P[id];
@@ -176,7 +181,7 @@ namespace FFD_VisualizerComponent
                 VisHelpers.FindSliceMinMax(axis, slice, Rx, Ry, Rz, Pval, out pMin, out pMax);
                 if (!(pMin < pMax)) { pMin -= 0.5; pMax += 0.5; }
                 mPrs = VisHelpers.BuildSliceMesh(axis, slice, Rx, Ry, Rz, dx, dy, dz, origin,
-                                                 Pval, pMin, pMax);
+                                                 Pval, pMin, pMax, cmap);
             }
 
             DA.SetData(1, mVel);

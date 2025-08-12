@@ -40,7 +40,15 @@
 #ifndef PRESSURE_RESIDUAL_CHECK_EVERY
 #define PRESSURE_RESIDUAL_CHECK_EVERY 0
 #endif
-
+// Cached read-only load (falls back on older archs)
+template<typename T>
+__device__ __forceinline__ T ldg(const T * p) {
+#if __CUDA_ARCH__ >= 350
+    return __ldg(p);
+#else
+    return *p;
+#endif
+}
 /*------------------------------------  utilities ------------------------------------  */
 
 inline void gpuAssert(cudaError_t c, const char* f, int l)
@@ -128,40 +136,93 @@ __device__ float sampleLinear(const float* s, float gx, float gy, float gz,
 
 
 /* ------------------------------------  advection------------------------------------  */
-__global__ void AdvectKernel(float* dst, const float* src,
-    const float* u, const float* v, const float* w,
-    const unsigned char* flag,
+__global__ void AdvectKernel(float* __restrict__ dst, const float* __restrict__ src,
+    const float* __restrict__ u, const float* __restrict__ v, const float* __restrict__ w,
+    const unsigned char* __restrict__ flag,
     int nx, int ny, int nz,
     float dt, float hx, float hy, float hz)
 {
     int id = blockDim.x * blockIdx.x + threadIdx.x;
-    if (id >= nx * ny * nz) return;
+    int N = nx * ny * nz;
+    if (id >= N) return;
 
-    if (isSolid(flag[id]) || isWall(flag[id])) { dst[id] = 0.f; return; }
+    unsigned char f = flag[id];
+    // Do NOT advect solids/walls. Also skip inflow (Dirichlet) – it will be re-enforced.
+    if (isSolid(f) || isWall(f)) { dst[id] = 0.f; return; }
+    if (isInflow(f)) { dst[id] = src[id]; return; }
 
-    int k = id / (nx * ny); int j = (id - k * nx * ny) / nx; int i = id - k * nx * ny - j * nx;
+    int k = id / (nx * ny);
+    int j = (id - k * nx * ny) / nx;
+    int i = id - k * nx * ny - j * nx;
 
     float px = (i + 0.5f) * hx, py = (j + 0.5f) * hy, pz = (k + 0.5f) * hz;
-    float velX = u[id], velY = v[id], velZ = w[id];
+    float velX = ldg(&u[id]), velY = ldg(&v[id]), velZ = ldg(&w[id]);
 
     float bx = px - velX * dt, by = py - velY * dt, bz = pz - velZ * dt;
     float gx = bx / hx - 0.5f, gy = by / hy - 0.5f, gz = bz / hz - 0.5f;
 
     dst[id] = sampleLinear(src, gx, gy, gz, nx, ny, nz);
 }
+__global__ void AdvectUVWKernel(
+    float* __restrict__ du, float* __restrict__ dv, float* __restrict__ dw,  // dst
+    const float* __restrict__ su, const float* __restrict__ sv, const float* __restrict__ sw, // src
+    const unsigned char* __restrict__ flag,
+    int nx, int ny, int nz,
+    float dt, float hx, float hy, float hz)
+{
+    int id = blockDim.x * blockIdx.x + threadIdx.x;
+    int N = nx * ny * nz;
+    if (id >= N) return;
 
+    unsigned char f = flag[id];
+
+    // Solids/Walls → zero. Inflow → pass through unchanged (BC will re-impose later).
+    if (isSolid(f) || isWall(f)) { du[id] = dv[id] = dw[id] = 0.f; return; }
+    if (isInflow(f)) { du[id] = su[id]; dv[id] = sv[id]; dw[id] = sw[id]; return; }
+
+    int k = id / (nx * ny);
+    int j = (id - k * nx * ny) / nx;
+    int i = id - k * nx * ny - j * nx;
+
+    // Cell center in world/grid units
+    float px = (i + 0.5f) * hx;
+    float py = (j + 0.5f) * hy;
+    float pz = (k + 0.5f) * hz;
+
+    // Velocity at cell center
+    float ux = su[id], vy = sv[id], wz = sw[id];
+
+    // Backtrace
+    float bx = px - ux * dt;
+    float by = py - vy * dt;
+    float bz = pz - wz * dt;
+
+    // Convert to sample-space (grid indices centered at 0.5 offset)
+    float gx = bx / hx - 0.5f;
+    float gy = by / hy - 0.5f;
+    float gz = bz / hz - 0.5f;
+
+    // Sample each component from its own source slab
+    du[id] = sampleLinear(su, gx, gy, gz, nx, ny, nz);
+    dv[id] = sampleLinear(sv, gx, gy, gz, nx, ny, nz);
+    dw[id] = sampleLinear(sw, gx, gy, gz, nx, ny, nz);
+}
 
 /* ------------------------------------  diffusion ------------------------------------  */
-__global__ void DiffuseJacobiKernel(float* dst, const float* src,
-    const unsigned char* flag,
+/*__global__ void DiffuseJacobiKernel(float* __restrict__ dst, const float* __restrict__ src,
+    const unsigned char* __restrict__ flag,
     int nx, int ny, int nz,
     float ax, float ay, float az, float rBeta)
 {
     int id = blockDim.x * blockIdx.x + threadIdx.x;
-    if (id >= nx * ny * nz) return;
-    if (isSolid(flag[id]) || isWall(flag[id])) { dst[id] = 0.f; return; }
+    int N = nx * ny * nz;
+    if (id >= N) return;
 
-    int k = id / (nx * ny);
+    unsigned char f = flag[id];
+    if (isSolid(f) || isWall(f)) { dst[id] = 0.f; return; }
+    if (isInflow(f)) { dst[id] = src[id]; return; } // keep prescribed inflow
+
+    int k = id / (nx * ny);                                                                           /////////////Old. The new one removes 2/3 of the launches inside the diffusion loop 
     int j = (id - k * nx * ny) / nx;
     int i = id - k * nx * ny - j * nx;
 
@@ -172,8 +233,47 @@ __global__ void DiffuseJacobiKernel(float* dst, const float* src,
 
     // Jacobi update with anisotropic weights
     dst[id] = (src[id] + ax * sx + ay * sy + az * sz) * rBeta;
-}
+}*/
+__global__ void DiffuseJacobiUVWKernel(
+    float* __restrict__ du, float* __restrict__ dv, float* __restrict__ dw,   // dst
+    const float* __restrict__ su, const float* __restrict__ sv, const float* __restrict__ sw, // src
+    const unsigned char* __restrict__ flag,
+    int nx, int ny, int nz,
+    float ax, float ay, float az, float rBeta)
+{
+    int id = blockDim.x * blockIdx.x + threadIdx.x;
+    int N = nx * ny * nz;
+    if (id >= N) return;
 
+    unsigned char f = flag[id];
+
+    // Walls/solids → zero; inflow → pass through (Dirichlet)
+    if (isSolid(f) || isWall(f)) { du[id] = dv[id] = dw[id] = 0.f; return; }
+    if (isInflow(f)) { du[id] = su[id]; dv[id] = sv[id]; dw[id] = sw[id]; return; }
+
+    int k = id / (nx * ny);
+    int j = (id - k * nx * ny) / nx;
+    int i = id - k * nx * ny - j * nx;
+
+    // neighbor sums per axis, per component
+    float ux = su[id], vx = sv[id], wx = sw[id];
+
+    float u_sx = at(su, i + 1, j, k, nx, ny, nz) + at(su, i - 1, j, k, nx, ny, nz);
+    float u_sy = at(su, i, j + 1, k, nx, ny, nz) + at(su, i, j - 1, k, nx, ny, nz);
+    float u_sz = at(su, i, j, k + 1, nx, ny, nz) + at(su, i, j, k - 1, nx, ny, nz);
+
+    float v_sx = at(sv, i + 1, j, k, nx, ny, nz) + at(sv, i - 1, j, k, nx, ny, nz);
+    float v_sy = at(sv, i, j + 1, k, nx, ny, nz) + at(sv, i, j - 1, k, nx, ny, nz);
+    float v_sz = at(sv, i, j, k + 1, nx, ny, nz) + at(sv, i, j, k - 1, nx, ny, nz);
+
+    float w_sx = at(sw, i + 1, j, k, nx, ny, nz) + at(sw, i - 1, j, k, nx, ny, nz);
+    float w_sy = at(sw, i, j + 1, k, nx, ny, nz) + at(sw, i, j - 1, k, nx, ny, nz);
+    float w_sz = at(sw, i, j, k + 1, nx, ny, nz) + at(sw, i, j, k - 1, nx, ny, nz);
+
+    du[id] = (ux + ax * u_sx + ay * u_sy + az * u_sz) * rBeta;
+    dv[id] = (vx + ax * v_sx + ay * v_sy + az * v_sz) * rBeta;
+    dw[id] = (wx + ax * w_sx + ay * w_sy + az * w_sz) * rBeta;
+}
 
 /* ------------------------------------  divergence ------------------------------------  */
 __global__ void DivergenceKernel(const float* u, const float* v, const float* w,
@@ -352,6 +452,7 @@ __global__ void OutflowZeroGradKernel(
     v[id] = v[nid];
     w[id] = w[nid];
 }
+
 /* ------------------------------------ host entry ------------------------------------ */
 extern "C" __declspec(dllexport)
 int RunCFDSimulation(const unsigned char* hFlag,
@@ -444,9 +545,21 @@ int RunCFDSimulation(const unsigned char* hFlag,
     for (int step = 0; step < NUM_STEPS; ++step)
     {
         /* 1 ─ advection ---------------------------------------------- */
-        AdvectKernel << <grd, blk >> > (u1, u, u, v, w, dFlag, nx, ny, nz, dt, hx, hy, hz);
+        /*AdvectKernel << <grd, blk >> > (u1, u, u, v, w, dFlag, nx, ny, nz, dt, hx, hy, hz);
         AdvectKernel << <grd, blk >> > (v1, v, u, v, w, dFlag, nx, ny, nz, dt, hx, hy, hz);
-        AdvectKernel << <grd, blk >> > (w1, w, u, v, w, dFlag, nx, ny, nz, dt, hx, hy, hz);
+        AdvectKernel << <grd, blk >> > (w1, w, u, v, w, dFlag, nx, ny, nz, dt, hx, hy, hz);          ///////Old thats why commented out the new one avoids re-doing the back-trace and boundary checks three times and improves cache reuse.  
+        float* tmp;
+        tmp = u; u = u1; u1 = tmp;
+        tmp = v; v = v1; v1 = tmp;
+        tmp = w; w = w1; w1 = tmp;
+        CUDA_CHECK_KERNEL();*/
+        /* 1 ─ advection (fused u,v,w) -------------------------------- */
+        AdvectUVWKernel << <grd, blk >> > (
+            u1, v1, w1,     // dst
+            u, v, w,      // src
+            dFlag,
+            nx, ny, nz,
+            dt, hx, hy, hz);
         float* tmp;
         tmp = u; u = u1; u1 = tmp;
         tmp = v; v = v1; v1 = tmp;
@@ -454,7 +567,7 @@ int RunCFDSimulation(const unsigned char* hFlag,
         CUDA_CHECK_KERNEL();
 
         /* 2 ─ viscosity (implicit Jacobi) ---------------------------- */
-        for (int it = 0; it < DIFF_ITERS; ++it)
+        /*for (int it = 0; it < DIFF_ITERS; ++it)
         {
             DiffuseJacobiKernel << <grd, blk >> > (u1, u, dFlag, nx, ny, nz, aDx, aDy, aDz, rBD);
             DiffuseJacobiKernel << <grd, blk >> > (v1, v, dFlag, nx, ny, nz, aDx, aDy, aDz, rBD);
@@ -464,8 +577,20 @@ int RunCFDSimulation(const unsigned char* hFlag,
             tmp = w; w = w1; w1 = tmp;
         }
         BoundaryVelocityKernel << <grd, blk >> > (u, v, w, dFlag, inX, inY, inZ, N);
+        CUDA_CHECK_KERNEL();*/
+        for (int it = 0; it < DIFF_ITERS; ++it)
+        {
+            DiffuseJacobiUVWKernel << <grd, blk >> > (u1, v1, w1,
+                u, v, w,
+                dFlag, nx, ny, nz,
+                aDx, aDy, aDz, rBD);
+            float* tmp;
+            tmp = u; u = u1; u1 = tmp;
+            tmp = v; v = v1; v1 = tmp;
+            tmp = w; w = w1; w1 = tmp;
+        }
+        BoundaryVelocityKernel << <grd, blk >> > (u, v, w, dFlag, inX, inY, inZ, N);
         CUDA_CHECK_KERNEL();
-
         /* 3 ─ divergence --------------------------------------------- */
         DivergenceKernel << <grd, blk >> > (u, v, w, dFlag, div, nx, ny, nz, hx, hy, hz);
         CUDA_CHECK_KERNEL();
